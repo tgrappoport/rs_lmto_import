@@ -160,7 +160,8 @@ def find_material_files(material_dir: str) -> Tuple[str, str]:
 
 def load_material(material_dir: str, orbitals_per_atom: int,
                    spin_labels: Sequence[str] = ("u", "d"),
-                   value_threshold: float = 1e-8) -> Tuple[latt.Lattice, dict]:
+                   value_threshold: float = 1e-8,
+                   max_hopping_range: int = None) -> Tuple[latt.Lattice, dict]:
     """Find, parse, and build the KITE Lattice for a material folder in one
     call -- the folder must contain exactly one `*_hr.dat` and one
     `*_lat.dat` (any prefix). See build_lattice() for the other parameters."""
@@ -168,7 +169,8 @@ def load_material(material_dir: str, orbitals_per_atom: int,
     lat = parse_lat_file(lat_path)
     hr = parse_hr_file(hr_path)
     return build_lattice(lat, hr, orbitals_per_atom=orbitals_per_atom,
-                          spin_labels=spin_labels, value_threshold=value_threshold)
+                          spin_labels=spin_labels, value_threshold=value_threshold,
+                          max_hopping_range=max_hopping_range)
 
 
 def _orbital_names(atom_labels: Sequence[str], orbitals_per_atom: int,
@@ -228,9 +230,187 @@ def _active_dims(hr: Dict[Tuple[RVec, int, int], complex]) -> List[int]:
     return [axis for axis in range(3) if active[axis]]
 
 
+def drop_core_orbitals(hr: Dict[Tuple[RVec, int, int], complex],
+                        atom_labels: Sequence[str], orbitals_per_atom: int,
+                        spin_labels: Sequence[str], energy_cutoff: float
+                        ) -> Tuple[Dict[Tuple[RVec, int, int], complex], int, dict]:
+    """Drop deep, core-like orbitals (onsite energy < energy_cutoff) from the
+    RAW parsed hr dict, BEFORE build_lattice() -- e.g. "removed orbitals with
+    energy much much lower than 0... removing the core that does not matter
+    for our calculation", the same kind of trim done previously on PAOFLOW
+    DFT data for another material.
+
+    Uniform per atom TYPE (label): every atom sharing a label is required to
+    agree, PER SPIN CHANNEL, on that spin's onsite energy for each spatial
+    orbital -- this preserves the "every atom of this label has the SAME
+    orbitals, same order" assumption the rest of this module
+    (_orbital_names, embed_atomic_operator, standard_operators) and
+    mos2_vacancies.py's per-atom-type vacancy schemes both rely on. Raises
+    ValueError if that agreement doesn't hold, rather than silently picking
+    one atom's answer.
+
+    The two spin channels are NOT required to agree with each other: with
+    spin-orbit coupling and broken inversion symmetry (the physical
+    situation here), a spatial orbital's spin-up and spin-down onsite
+    energies can genuinely differ (confirmed directly in this dataset --
+    e.g. Mo's spatial index 0 has onsite u=+6.08 eV, d=-14.01 eV). A spatial
+    orbital is dropped only when BOTH spin channels fall below
+    energy_cutoff (the conservative choice: keeps an orbital if either spin
+    is still active near the energies of interest), never based on either
+    spin alone.
+
+    Every atom LABEL must end up with the SAME NUMBER of surviving orbitals
+    (raises ValueError otherwise) -- required so a single orbitals_per_atom
+    scalar still describes the whole lattice, matching build_lattice()'s
+    existing "orbitals_per_atom must be the same for every atom" contract.
+    This does NOT by itself guarantee the SAME spatial orbitals (e.g. same
+    spd character) were dropped for every label, only the same count --
+    if the caller drops a different spatial index per label (e.g. Mo's 's'
+    vs S's 'dxy'), the shared 9x9 spd L/S/quadrupole operator machinery in
+    this module (which assumes identical spd ordering on every atom) would
+    need updating to match; this function reports which indices were
+    dropped per label so that can be checked, but does not enforce it.
+
+    Returns (hr_new, new_orbitals_per_atom, dropped_info), where hr_new has
+    orbital indices REMAPPED to a contiguous 1-indexed scheme (same atom
+    order, same spin-major order within each atom, just fewer spatial
+    orbitals), ready to pass to build_lattice(..., orbitals_per_atom=
+    new_orbitals_per_atom, ...). dropped_info maps each atom label to the
+    list of (spatial_index, onsite_energy) actually dropped, so the caller
+    can verify nothing important got cut before trusting it.
+    """
+    n_spin = len(spin_labels)
+    n_spatial = orbitals_per_atom // n_spin
+    names, atom_of = _orbital_names(atom_labels, orbitals_per_atom, spin_labels)
+
+    onsite = {}
+    for (r, i, j), value in hr.items():
+        if r == (0, 0, 0) and i == j:
+            onsite[i] = value.real
+
+    label_of_atom = list(atom_labels)
+    atoms_by_label: Dict[str, List[int]] = {}
+    for atom_idx, label in enumerate(label_of_atom):
+        atoms_by_label.setdefault(label, []).append(atom_idx)
+
+    keep_spatial: Dict[str, List[int]] = {}
+    dropped_info: Dict[str, List[Tuple[int, Tuple[float, ...]]]] = {}
+    for label, atom_indices in atoms_by_label.items():
+        keep: List[int] = []
+        dropped: List[Tuple[int, Tuple[float, ...]]] = []
+        for spatial in range(n_spatial):
+            spin_energies = []
+            for spin_idx in range(n_spin):
+                energies = [
+                    onsite.get(atom_idx * orbitals_per_atom + spin_idx * n_spatial + spatial + 1, 0.0)
+                    for atom_idx in atom_indices
+                ]
+                if not np.allclose(energies, energies[0], atol=1e-6):
+                    raise ValueError(
+                        f"onsite energy for spatial orbital index {spatial}, spin "
+                        f"{spin_labels[spin_idx]!r}, of atom label {label!r} is not "
+                        f"the same across every atom instance of that label "
+                        f"({energies}) -- cannot uniformly decide whether to drop it."
+                    )
+                spin_energies.append(energies[0])
+            if all(e < energy_cutoff for e in spin_energies):
+                dropped.append((spatial, tuple(spin_energies)))
+            else:
+                keep.append(spatial)
+        keep_spatial[label] = keep
+        dropped_info[label] = dropped
+
+    counts = {label: len(keep) for label, keep in keep_spatial.items()}
+    if len(set(counts.values())) > 1:
+        raise ValueError(
+            f"energy_cutoff={energy_cutoff} drops a different number of "
+            f"orbitals per atom label ({counts}) -- pick a cutoff that drops "
+            f"the same count from every label, or this dataset can't be "
+            f"described by a single orbitals_per_atom scalar any more."
+        )
+    new_orbitals_per_atom = next(iter(counts.values())) * n_spin
+
+    # Build the remap: old 1-indexed orbital -> new 1-indexed orbital,
+    # contiguous, same atom order, same spin-major order, fewer spatial slots.
+    remap = {}
+    new_k = 0
+    for atom_idx, label in enumerate(label_of_atom):
+        keep = keep_spatial[label]
+        for spin_idx in range(n_spin):
+            for spatial in keep:
+                old_k = atom_idx * orbitals_per_atom + spin_idx * n_spatial + spatial + 1
+                new_k += 1
+                remap[old_k] = new_k
+
+    hr_new = {}
+    for (r, i, j), value in hr.items():
+        if i in remap and j in remap:
+            hr_new[(r, remap[i], remap[j])] = value
+
+    return hr_new, new_orbitals_per_atom, dropped_info
+
+
+def drop_named_orbitals(hr: Dict[Tuple[RVec, int, int], complex],
+                         atom_labels: Sequence[str], orbitals_per_atom: int,
+                         spin_labels: Sequence[str], names_to_drop: Sequence[str]
+                         ) -> Tuple[Dict[Tuple[RVec, int, int], complex], List[str]]:
+    """Remove specific orbitals by name from the RAW parsed hr dict, BEFORE
+    building a lattice -- unlike drop_core_orbitals() (a uniform energy
+    cutoff, same count dropped per atom TYPE), this allows an ASYMMETRIC
+    removal (e.g. drop an orbital from only one atom, not every atom
+    sharing its label), for cases where a specific symmetry/physics
+    argument -- not a blanket cutoff -- picks out a particular orbital.
+
+    Concretely: verified (by comparing full vs reduced band structures
+    directly along a k-path, not by assumption) that removing Mo's own
+    s-orbital (both spin channels) leaves the rest of the spectrum
+    essentially unchanged -- it only removes the 2 (of 4) deep bands that
+    actually involve Mo, while the other 2 (an S1/S2 mirror-pair
+    combination not involving Mo at all) and everything else survive
+    intact to a few hundredths of an eV.
+
+    names_to_drop: orbital names in the f"{atom_label}_{spin}{spatial}"
+    convention _orbital_names() itself uses (e.g. "Mo_u0", "Mo_d0").
+
+    Because this can leave different atoms with different orbital counts,
+    it does NOT return a single new_orbitals_per_atom scalar -- the result
+    can't be passed straight to build_lattice() (which requires one count
+    for every atom). Returns (hr_new, remaining_names): hr_new has orbital
+    indices REMAPPED to a contiguous 1-indexed scheme (dropped names simply
+    skipped, relative order otherwise unchanged), and remaining_names is the
+    ordered orbital-name list matching hr_new's new indices -- build a
+    kite.lattice.Lattice directly from these (add_sublattices/add_hoppings,
+    looking up each name's atom position by splitting off the
+    "{atom_label}_" prefix) rather than through build_lattice() itself.
+    """
+    names, _atom_of = _orbital_names(atom_labels, orbitals_per_atom, spin_labels)
+    drop_set = set(names_to_drop)
+    unknown = drop_set - set(names)
+    if unknown:
+        raise ValueError(f"names_to_drop contains unknown orbital name(s): {unknown}")
+
+    remap = {}
+    remaining_names: List[str] = []
+    new_k = 0
+    for old_k, name in enumerate(names, start=1):
+        if name in drop_set:
+            continue
+        new_k += 1
+        remap[old_k] = new_k
+        remaining_names.append(name)
+
+    hr_new = {}
+    for (r, i, j), value in hr.items():
+        if i in remap and j in remap:
+            hr_new[(r, remap[i], remap[j])] = value
+
+    return hr_new, remaining_names
+
+
 def build_lattice(lat: LatticeFile, hr: Dict[Tuple[RVec, int, int], complex],
                    orbitals_per_atom: int, spin_labels: Sequence[str] = ("u", "d"),
-                   value_threshold: float = 1e-8) -> Tuple[latt.Lattice, dict]:
+                   value_threshold: float = 1e-8,
+                   max_hopping_range: int = None) -> Tuple[latt.Lattice, dict]:
     """Build a kite.lattice.Lattice from parsed RS-LMTO data.
 
     orbitals_per_atom must be the same for every atom (contiguous blocks,
@@ -242,9 +422,18 @@ def build_lattice(lat: LatticeFile, hr: Dict[Tuple[RVec, int, int], complex],
     near-numerical-noise) zeros; dropping them keeps the KITE lattice from
     carrying dead weight. Set to 0.0 to keep everything.
 
-    Returns (lattice, stats) where stats is a small dict of counts (kept
-    onsite terms, kept hoppings, dropped-by-threshold count, etc.) so the
-    caller can sanity-check the import rather than trust it silently.
+    max_hopping_range: opt-in truncation, default None (current behavior:
+    fail closed below if any hopping reaches further than KITE's compiled
+    NGHOSTS). When set to an integer (e.g. 2, matching NGHOSTS), every
+    hopping with |R| > max_hopping_range in any direction is dropped BEFORE
+    the NGHOSTS check runs, rather than raising. Dropping real hopping data
+    changes the physics, if only slightly, so this reports exactly what was
+    thrown away (count and largest dropped magnitude, in stats below) --
+    verify that against the energy scale you actually care about (e.g. by
+    comparing a band structure with and without this truncation) before
+    trusting results computed with it. Setting this does NOT bypass the
+    NGHOSTS check itself: if max_hopping_range is still larger than NGHOSTS,
+    the same fail-closed error fires afterward, unchanged.
     """
     n_atoms = len(lat.atom_labels)
     n_orb_total = n_atoms * orbitals_per_atom
@@ -258,12 +447,27 @@ def build_lattice(lat: LatticeFile, hr: Dict[Tuple[RVec, int, int], complex],
 
     names, atom_of = _orbital_names(lat.atom_labels, orbitals_per_atom, spin_labels)
 
+    dropped_range = 0
+    dropped_range_max_magnitude = 0.0
+    if max_hopping_range is not None:
+        kept_hr = {}
+        for key, value in hr.items():
+            r, _i, _j = key
+            if max(abs(c) for c in r) > max_hopping_range:
+                dropped_range += 1
+                dropped_range_max_magnitude = max(dropped_range_max_magnitude, abs(value))
+            else:
+                kept_hr[key] = value
+        hr = kept_hr
+
     # KITE's C++ engine hardcodes NGHOSTS=2 (Src/Generic.hpp) -- the ghost-cell
     # width used for periodic wraparound and inter-domain communication in
     # EVERY periodic direction, regardless of how many divisions are used.
     # A hopping reaching further than that is not just slow, it is silently
     # WRONG (the ghost region doesn't hold the needed neighbor-cell data) --
-    # nothing else in the pipeline checks this, so fail closed here instead.
+    # nothing else in the pipeline checks this, so fail closed here instead
+    # (even after an opt-in max_hopping_range truncation above, in case that
+    # value itself was still set larger than NGHOSTS).
     max_range = max((abs(component) for (r, _i, _j) in hr for component in r),
                      default=0)
     if max_range > _KITE_NGHOSTS:
@@ -272,7 +476,8 @@ def build_lattice(lat: LatticeFile, hr: Dict[Tuple[RVec, int, int], complex],
             f"direction, but KITE's compiled NGHOSTS={_KITE_NGHOSTS} only "
             f"supports hoppings up to {_KITE_NGHOSTS} cells away in any "
             f"periodic direction -- results would be silently wrong, not just "
-            f"slow. Recompile KITE with a larger NGHOSTS (Src/Generic.hpp) "
+            f"slow. Recompile KITE with a larger NGHOSTS (Src/Generic.hpp), or "
+            f"pass max_hopping_range<={_KITE_NGHOSTS} to explicitly truncate, "
             f"before using this dataset."
         )
 
@@ -340,6 +545,8 @@ def build_lattice(lat: LatticeFile, hr: Dict[Tuple[RVec, int, int], complex],
         "onsite_terms_kept": onsite_kept,
         "hoppings_kept": len(hoppings),
         "dropped_below_threshold": dropped_small,
+        "dropped_by_max_hopping_range": dropped_range,
+        "dropped_by_max_hopping_range_max_magnitude": dropped_range_max_magnitude,
         "fermi_level": lat.fermi_level,
     }
     return lattice, stats
