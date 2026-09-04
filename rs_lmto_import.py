@@ -14,10 +14,13 @@ of plain-text files:
     labels running over ALL orbitals of ALL atoms (not per-atom indices).
 
 This module has no knowledge of "spd" or physical orbital character -- it
-only needs to know how many orbitals belong to each atom (assumed the SAME
-count for every atom, in contiguous blocks, in the same atom order as the
-`_lat.dat` position list) to build one KITE sublattice per orbital, all
-orbitals of one atom sharing that atom's position.
+only needs to know which orbitals belong to each atom (contiguous blocks,
+in the same atom order as the `_lat.dat` position list) to build one KITE
+sublattice per orbital, all orbitals of one atom sharing that atom's
+position. Atoms need NOT carry the same number of orbitals: KITE registers
+one sublattice per orbital and never sees a per-atom count, so a basis
+where sulfur has lost its deep 's' while molybdenum keeps all nine spd
+orbitals exports exactly as well (see _normalize_basis()).
 
 Convention check performed once, empirically, before writing this module:
 the `_hr.dat` data stores BOTH directions of every hopping explicitly, i.e.
@@ -121,9 +124,13 @@ def parse_hr_file(path: str) -> Dict[Tuple[RVec, int, int], complex]:
     """Parse a header-less Wannier90-style `_hr.dat` file.
 
     Returns {(R, i, j): H_ij(R)}, i/j 1-indexed exactly as stored in the
-    file (NOT remapped to per-atom indices -- that happens in
-    build_lattice()). R is always the full 3-component (R1, R2, R3) as
-    stored; build_lattice() decides which components are actually periodic."""
+    file. The file's own order is SPIN-MAJOR OVER THE WHOLE SYSTEM (all
+    atoms for spin up, then all atoms for spin down) -- NOT the atom-major
+    order the rest of this module uses. Pass the result through
+    reorder_spin_major_to_atom_major() before build_lattice() or
+    drop_core_orbitals(); load_material() already does this for you.
+    R is always the full 3-component (R1, R2, R3) as stored;
+    build_lattice() decides which components are actually periodic."""
     data: Dict[Tuple[RVec, int, int], complex] = {}
     with open(path) as f:
         for line_no, line in enumerate(f, start=1):
@@ -160,7 +167,7 @@ def find_material_files(material_dir: str) -> Tuple[str, str]:
 
 def load_material(material_dir: str, orbitals_per_atom: int,
                    spin_labels: Sequence[str] = ("u", "d"),
-                   value_threshold: float = 1e-8,
+                   value_threshold: float = 1e-3,
                    max_hopping_range: int = None) -> Tuple[latt.Lattice, dict]:
     """Find, parse, and build the KITE Lattice for a material folder in one
     call -- the folder must contain exactly one `*_hr.dat` and one
@@ -168,36 +175,162 @@ def load_material(material_dir: str, orbitals_per_atom: int,
     hr_path, lat_path = find_material_files(material_dir)
     lat = parse_lat_file(lat_path)
     hr = parse_hr_file(hr_path)
+    # parse_hr_file() returns the file's own spin-major-over-the-whole-system
+    # index order; everything below expects atom-major. See that function.
+    hr = reorder_spin_major_to_atom_major(
+        hr, n_atoms=len(lat.atom_labels), orbitals_per_atom=orbitals_per_atom,
+        spin_labels=spin_labels)
     return build_lattice(lat, hr, orbitals_per_atom=orbitals_per_atom,
                           spin_labels=spin_labels, value_threshold=value_threshold,
                           max_hopping_range=max_hopping_range)
 
 
-def _orbital_names(atom_labels: Sequence[str], orbitals_per_atom: int,
-                    spin_labels: Sequence[str]) -> Tuple[List[str], List[int]]:
-    """1-indexed _hr.dat orbital position -> (sublattice name, atom index).
+def _normalize_basis(n_atoms: int, orbitals_per_atom, spin_labels: Sequence[str]
+                      ) -> List[List[int]]:
+    """Canonical basis description: per atom, WHICH spatial orbitals it keeps.
 
-    Assumes contiguous per-atom blocks in the same order as atom_labels,
-    spin-major within each atom (all of spin_labels[0]'s spatial orbitals,
-    then all of spin_labels[1]'s, ...) -- confirmed against this specific
-    RS-LMTO output's convention (9 spd orbitals x 2 spins = 18/atom,
-    spin-major) before writing this module; verify against your own code's
-    convention if it differs."""
-    if orbitals_per_atom % len(spin_labels) != 0:
+    Atoms are not required to share a basis. `orbitals_per_atom` may be:
+
+      - an int -- every atom has the same count, keeping spatial indices
+        0..n_spatial-1 (the plain, undropped case);
+      - a sequence of ints, one per atom -- total orbitals (spins included)
+        for that atom, keeping its first count//n_spin spatial indices;
+      - a sequence of index lists, one per atom -- exactly which spatial
+        orbitals survive on that atom, in the ORIGINAL numbering (what the
+        drop_*() functions return).
+
+    The third form is the one that carries enough information for the L/S/
+    quadrupole operators: after dropping, say, only sulfur's 's', the
+    operators for that atom are the 9x9 spd matrices restricted to the rows
+    and columns that remain, which a bare count cannot express.
+    """
+    n_spin = len(spin_labels)
+
+    def _from_count(total: int) -> List[int]:
+        if total % n_spin != 0:
+            raise ValueError(
+                f"orbitals per atom ({total}) is not divisible by "
+                f"len(spin_labels) ({n_spin})"
+            )
+        return list(range(total // n_spin))
+
+    if isinstance(orbitals_per_atom, (int, np.integer)):
+        return [_from_count(int(orbitals_per_atom)) for _ in range(n_atoms)]
+
+    spec = list(orbitals_per_atom)
+    if len(spec) != n_atoms:
         raise ValueError(
-            f"orbitals_per_atom ({orbitals_per_atom}) is not divisible by "
-            f"len(spin_labels) ({len(spin_labels)})"
+            f"orbitals_per_atom has {len(spec)} entries but there are "
+            f"{n_atoms} atoms"
         )
-    n_spatial = orbitals_per_atom // len(spin_labels)
+    basis: List[List[int]] = []
+    for entry in spec:
+        if isinstance(entry, (int, np.integer)):
+            basis.append(_from_count(int(entry)))
+        else:
+            kept = [int(k) for k in entry]
+            if sorted(kept) != kept or len(set(kept)) != len(kept):
+                raise ValueError(
+                    f"spatial orbital indices must be strictly increasing "
+                    f"and unique, got {entry!r}"
+                )
+            basis.append(kept)
+    return basis
+
+
+def _basis_offsets(basis: Sequence[Sequence[int]], n_spin: int) -> List[int]:
+    """Index of each atom's first orbital in the full system."""
+    offsets, running = [], 0
+    for kept in basis:
+        offsets.append(running)
+        running += len(kept) * n_spin
+    return offsets
+
+
+def _orbital_names(atom_labels: Sequence[str], orbitals_per_atom,
+                    spin_labels: Sequence[str]) -> Tuple[List[str], List[int]]:
+    """1-indexed orbital position -> (sublattice name, atom index).
+
+    Contiguous per-atom blocks in the same order as atom_labels, spin-major
+    within each atom (all of spin_labels[0]'s spatial orbitals, then all of
+    spin_labels[1]'s, ...). This is the module's INTERNAL order; the file's
+    own order is different, see reorder_spin_major_to_atom_major().
+
+    Atoms may carry different bases -- see _normalize_basis(). Names use the
+    ORIGINAL spatial index, so an orbital keeps its name when others around
+    it are dropped (e.g. sulfur's px stays "S1_u1" even after "S1_u0" is
+    removed), which keeps names stable across a drop_*() call.
+    """
+    basis = _normalize_basis(len(atom_labels), orbitals_per_atom, spin_labels)
 
     names: List[str] = []
     atom_of: List[int] = []
-    for atom_idx, atom_label in enumerate(atom_labels):
+    for atom_idx, (atom_label, kept) in enumerate(zip(atom_labels, basis)):
         for spin in spin_labels:
-            for orb in range(n_spatial):
+            for orb in kept:
                 names.append(f"{atom_label}_{spin}{orb}")
                 atom_of.append(atom_idx)
     return names, atom_of
+
+
+def reorder_spin_major_to_atom_major(
+        hr: Dict[Tuple[RVec, int, int], complex], n_atoms: int,
+        orbitals_per_atom: int, spin_labels: Sequence[str] = ("u", "d")
+        ) -> Dict[Tuple[RVec, int, int], complex]:
+    """Permute `_hr.dat` orbital indices from the FILE's order to this
+    module's internal order.
+
+    The RS-LMTO `_hr.dat` is written SPIN-MAJOR OVER THE WHOLE SYSTEM: all
+    atoms' spatial orbitals for spin up first, then all atoms' again for
+    spin down, i.e. file index (0-based)
+
+        k_file = spin * (n_atoms * n_spatial) + atom * n_spatial + spatial
+
+    Everything downstream in this module (_orbital_names,
+    embed_atomic_operator, drop_core_orbitals) instead uses ATOM-MAJOR
+    order, spin-major within each atom:
+
+        k_internal = atom * orbitals_per_atom + spin * n_spatial + spatial
+
+    Both describe the same Hamiltonian; the atom-major one is used on the
+    KITE side because it keeps each atom's 2*n_spatial orbitals contiguous,
+    which puts the large on-site and short-range blocks near the diagonal
+    instead of spreading them across a half-matrix stride.
+
+    Verified against the MoS2 dataset rather than assumed: the file's
+    on-site diagonal repeats as (Mo, S, S | Mo, S, S) -- period 3 blocks of
+    9, spin outermost -- and the difference between the two halves,
+    H_upup - H_downdown, reproduces lambda*Lz in the _SPD_BASIS order to a
+    relative residual of 1e-11, giving lambda_d(Mo) = 0.0748 eV (the known
+    Mo 4d spin-orbit constant, which also fixes the file's energy unit as
+    eV). Re-check this for any new dataset instead of assuming it.
+    """
+    n_spin = len(spin_labels)
+    if orbitals_per_atom % n_spin != 0:
+        raise ValueError(
+            f"orbitals_per_atom ({orbitals_per_atom}) is not divisible by "
+            f"len(spin_labels) ({n_spin})"
+        )
+    n_spatial = orbitals_per_atom // n_spin
+    n_orb_total = n_atoms * orbitals_per_atom
+
+    perm = {}
+    for spin in range(n_spin):
+        for atom in range(n_atoms):
+            for spatial in range(n_spatial):
+                k_file = spin * (n_atoms * n_spatial) + atom * n_spatial + spatial
+                k_internal = atom * orbitals_per_atom + spin * n_spatial + spatial
+                perm[k_file + 1] = k_internal + 1
+
+    max_index = max(max(i, j) for (_r, i, j) in hr)
+    if max_index != n_orb_total:
+        raise ValueError(
+            f"_hr.dat's highest orbital index is {max_index}, but "
+            f"{n_atoms} atoms x {orbitals_per_atom} orbitals/atom = "
+            f"{n_orb_total} were expected -- orbitals_per_atom is likely wrong."
+        )
+
+    return {(r, perm[i], perm[j]): value for (r, i, j), value in hr.items()}
 
 
 def _is_positive(r: RVec) -> bool:
@@ -233,7 +366,8 @@ def _active_dims(hr: Dict[Tuple[RVec, int, int], complex]) -> List[int]:
 def drop_core_orbitals(hr: Dict[Tuple[RVec, int, int], complex],
                         atom_labels: Sequence[str], orbitals_per_atom: int,
                         spin_labels: Sequence[str], energy_cutoff: float
-                        ) -> Tuple[Dict[Tuple[RVec, int, int], complex], int, dict]:
+                        ) -> Tuple[Dict[Tuple[RVec, int, int], complex],
+                                   List[List[int]], dict]:
     """Drop deep, core-like orbitals (onsite energy < energy_cutoff) from the
     RAW parsed hr dict, BEFORE build_lattice() -- e.g. "removed orbitals with
     energy much much lower than 0... removing the core that does not matter
@@ -249,33 +383,33 @@ def drop_core_orbitals(hr: Dict[Tuple[RVec, int, int], complex],
     ValueError if that agreement doesn't hold, rather than silently picking
     one atom's answer.
 
-    The two spin channels are NOT required to agree with each other: with
-    spin-orbit coupling and broken inversion symmetry (the physical
-    situation here), a spatial orbital's spin-up and spin-down onsite
-    energies can genuinely differ (confirmed directly in this dataset --
-    e.g. Mo's spatial index 0 has onsite u=+6.08 eV, d=-14.01 eV). A spatial
-    orbital is dropped only when BOTH spin channels fall below
+    The two spin channels are NOT required to agree with each other, so
+    that a genuinely spin-polarised dataset still works. Note that in the
+    MoS2 data they DO agree exactly: the on-site diagonal is identical for
+    both spins, and the whole up/down difference is the off-diagonal
+    lambda*Lz of spin-orbit coupling. (An earlier version of this docstring
+    cited "Mo's spatial index 0 has onsite u=+6.08 eV, d=-14.01 eV" as
+    evidence of a real 20 eV spin splitting -- that was an artifact of
+    reading the file in the wrong orbital order, not physics. See
+    reorder_spin_major_to_atom_major().) A spatial orbital is dropped only
+    when BOTH spin channels fall below
     energy_cutoff (the conservative choice: keeps an orbital if either spin
     is still active near the energies of interest), never based on either
     spin alone.
 
-    Every atom LABEL must end up with the SAME NUMBER of surviving orbitals
-    (raises ValueError otherwise) -- required so a single orbitals_per_atom
-    scalar still describes the whole lattice, matching build_lattice()'s
-    existing "orbitals_per_atom must be the same for every atom" contract.
-    This does NOT by itself guarantee the SAME spatial orbitals (e.g. same
-    spd character) were dropped for every label, only the same count --
-    if the caller drops a different spatial index per label (e.g. Mo's 's'
-    vs S's 'dxy'), the shared 9x9 spd L/S/quadrupole operator machinery in
-    this module (which assumes identical spd ordering on every atom) would
-    need updating to match; this function reports which indices were
-    dropped per label so that can be checked, but does not enforce it.
+    Atom labels may end up with DIFFERENT numbers of surviving orbitals --
+    a cutoff that removes sulfur's deep 's' while leaving molybdenum
+    untouched is a normal, supported outcome, not an error. The result is a
+    per-atom basis and everything downstream takes it: build_lattice()
+    registers one sublattice per orbital regardless, and the L/S/quadrupole
+    operators restrict themselves to whatever each atom still has.
 
-    Returns (hr_new, new_orbitals_per_atom, dropped_info), where hr_new has
-    orbital indices REMAPPED to a contiguous 1-indexed scheme (same atom
-    order, same spin-major order within each atom, just fewer spatial
-    orbitals), ready to pass to build_lattice(..., orbitals_per_atom=
-    new_orbitals_per_atom, ...). dropped_info maps each atom label to the
+    Returns (hr_new, new_basis, dropped_info). hr_new has orbital indices
+    REMAPPED to a contiguous 1-indexed scheme (same atom order, same
+    spin-major order within each atom, just fewer spatial orbitals).
+    new_basis is a per-atom list of the surviving spatial indices, to pass
+    straight to build_lattice(..., orbitals_per_atom=new_basis, ...) and to
+    standard_operators(). dropped_info maps each atom label to the
     list of (spatial_index, onsite_energy) actually dropped, so the caller
     can verify nothing important got cut before trusting it.
     """
@@ -320,15 +454,10 @@ def drop_core_orbitals(hr: Dict[Tuple[RVec, int, int], complex],
         keep_spatial[label] = keep
         dropped_info[label] = dropped
 
-    counts = {label: len(keep) for label, keep in keep_spatial.items()}
-    if len(set(counts.values())) > 1:
-        raise ValueError(
-            f"energy_cutoff={energy_cutoff} drops a different number of "
-            f"orbitals per atom label ({counts}) -- pick a cutoff that drops "
-            f"the same count from every label, or this dataset can't be "
-            f"described by a single orbitals_per_atom scalar any more."
-        )
-    new_orbitals_per_atom = next(iter(counts.values())) * n_spin
+    # Different atom labels may end up with different numbers of surviving
+    # orbitals -- that is allowed. The result is a per-atom basis, which
+    # build_lattice() and the operator machinery both accept.
+    new_basis = [list(keep_spatial[label]) for label in label_of_atom]
 
     # Build the remap: old 1-indexed orbital -> new 1-indexed orbital,
     # contiguous, same atom order, same spin-major order, fewer spatial slots.
@@ -347,7 +476,7 @@ def drop_core_orbitals(hr: Dict[Tuple[RVec, int, int], complex],
         if i in remap and j in remap:
             hr_new[(r, remap[i], remap[j])] = value
 
-    return hr_new, new_orbitals_per_atom, dropped_info
+    return hr_new, new_basis, dropped_info
 
 
 def drop_named_orbitals(hr: Dict[Tuple[RVec, int, int], complex],
@@ -372,25 +501,35 @@ def drop_named_orbitals(hr: Dict[Tuple[RVec, int, int], complex],
     names_to_drop: orbital names in the f"{atom_label}_{spin}{spatial}"
     convention _orbital_names() itself uses (e.g. "Mo_u0", "Mo_d0").
 
-    Because this can leave different atoms with different orbital counts,
-    it does NOT return a single new_orbitals_per_atom scalar -- the result
-    can't be passed straight to build_lattice() (which requires one count
-    for every atom). Returns (hr_new, remaining_names): hr_new has orbital
-    indices REMAPPED to a contiguous 1-indexed scheme (dropped names simply
-    skipped, relative order otherwise unchanged), and remaining_names is the
-    ordered orbital-name list matching hr_new's new indices -- build a
-    kite.lattice.Lattice directly from these (add_sublattices/add_hoppings,
-    looking up each name's atom position by splitting off the
-    "{atom_label}_" prefix) rather than through build_lattice() itself.
+    Returns (hr_new, remaining_names, new_basis).
+
+    hr_new has orbital indices REMAPPED to a contiguous 1-indexed scheme
+    (dropped names simply skipped, relative order otherwise unchanged), and
+    remaining_names is the ordered orbital-name list matching those indices.
+
+    new_basis is the per-atom list of surviving spatial indices, ready for
+    build_lattice(..., orbitals_per_atom=new_basis, ...) -- atoms carrying
+    different bases is fine there.
+
+    The removal must be SPIN-SYMMETRIC: dropping a spatial orbital for one
+    spin but keeping it for the other (e.g. "Mo_u0" without "Mo_d0") raises
+    ValueError. A spin-asymmetric basis has no physical meaning here -- the
+    two channels describe the same spatial orbital -- and it would break the
+    kron(I_spin, op) structure every operator in this module is built on.
     """
-    names, _atom_of = _orbital_names(atom_labels, orbitals_per_atom, spin_labels)
+    names, atom_of = _orbital_names(atom_labels, orbitals_per_atom, spin_labels)
     drop_set = set(names_to_drop)
     unknown = drop_set - set(names)
     if unknown:
         raise ValueError(f"names_to_drop contains unknown orbital name(s): {unknown}")
 
+    n_spin = len(spin_labels)
     remap = {}
     remaining_names: List[str] = []
+    # per atom, per spin: which spatial indices survive
+    kept: List[Dict[str, List[int]]] = [
+        {spin: [] for spin in spin_labels} for _ in atom_labels
+    ]
     new_k = 0
     for old_k, name in enumerate(names, start=1):
         if name in drop_set:
@@ -398,29 +537,67 @@ def drop_named_orbitals(hr: Dict[Tuple[RVec, int, int], complex],
         new_k += 1
         remap[old_k] = new_k
         remaining_names.append(name)
+        spin_and_orb = name.split("_")[-1]
+        for spin in spin_labels:
+            if spin_and_orb.startswith(spin):
+                kept[atom_of[old_k - 1]][spin].append(int(spin_and_orb[len(spin):]))
+                break
+
+    # The removal must be spin-symmetric: both channels of an atom describe
+    # the same spatial orbital, so they have to survive or go together.
+    new_basis: List[List[int]] = []
+    for atom_idx, per_spin in enumerate(kept):
+        channels = [sorted(per_spin[spin]) for spin in spin_labels]
+        if any(c != channels[0] for c in channels[1:]):
+            asymmetric = sorted(set().union(*map(set, channels))
+                                 - set.intersection(*map(set, channels)))
+            raise ValueError(
+                f"removal is not spin-symmetric on atom "
+                f"{atom_labels[atom_idx]!r}: spatial orbital(s) {asymmetric} "
+                f"survive in some spin channels but not others "
+                f"({dict(zip(spin_labels, channels))}). Drop every spin "
+                f"channel of an orbital or none of them."
+            )
+        new_basis.append(channels[0])
 
     hr_new = {}
     for (r, i, j), value in hr.items():
         if i in remap and j in remap:
             hr_new[(r, remap[i], remap[j])] = value
 
-    return hr_new, remaining_names
+    return hr_new, remaining_names, new_basis
 
 
 def build_lattice(lat: LatticeFile, hr: Dict[Tuple[RVec, int, int], complex],
                    orbitals_per_atom: int, spin_labels: Sequence[str] = ("u", "d"),
-                   value_threshold: float = 1e-8,
+                   value_threshold: float = 1e-3,
                    max_hopping_range: int = None) -> Tuple[latt.Lattice, dict]:
     """Build a kite.lattice.Lattice from parsed RS-LMTO data.
 
-    orbitals_per_atom must be the same for every atom (contiguous blocks,
-    same order as lat.atom_labels) -- mixed per-atom basis sizes are not
-    supported by this simple mapping.
+    orbitals_per_atom describes the basis: an int when every atom carries
+    the same one, or a per-atom sequence when they differ (see
+    _normalize_basis() for the accepted forms). Atoms are NOT required to
+    agree -- KITE registers one sublattice per orbital and never sees a
+    per-atom count, so a lattice where, say, sulfur has lost its 's' while
+    molybdenum keeps all nine spd orbitals exports exactly as well. The
+    blocks stay contiguous and in lat.atom_labels order either way.
 
-    value_threshold: hopping/onsite magnitudes below this are dropped. The
-    RS-LMTO real-space cutoff sphere stores many explicit exact (or
-    near-numerical-noise) zeros; dropping them keeps the KITE lattice from
-    carrying dead weight. Set to 0.0 to keep everything.
+    value_threshold: hoppings smaller than this FRACTION of the largest
+    hopping in the dataset are dropped (default 1e-3). The cut is relative,
+    never absolute, for two reasons: it is invariant under the file's energy
+    unit, and an absolute cut calibrated on one material silently destroys
+    the physics of another -- in a twisted bilayer the interlayer hoppings
+    are tiny in absolute terms and are exactly what the calculation is
+    about. The reference is the largest HOPPING, not the largest matrix
+    element: on-site energies are typically far larger and are never
+    subject to this cut. Set to 0.0 to keep everything.
+
+    Beyond tidiness, this matters because the RS-LMTO real-space cutoff
+    sphere stores many explicit exact (or numerical-noise) zeros, which
+    would otherwise be carried into the lattice as dead weight. stats
+    reports both the absolute threshold this worked out to and the largest
+    magnitude actually discarded, so the cut can be checked against the
+    energy scales of the problem rather than trusted.
 
     max_hopping_range: opt-in truncation, default None (current behavior:
     fail closed below if any hopping reaches further than KITE's compiled
@@ -436,13 +613,15 @@ def build_lattice(lat: LatticeFile, hr: Dict[Tuple[RVec, int, int], complex],
     the same fail-closed error fires afterward, unchanged.
     """
     n_atoms = len(lat.atom_labels)
-    n_orb_total = n_atoms * orbitals_per_atom
-    max_index = max(i for (_r, i, _j) in hr)
+    basis = _normalize_basis(n_atoms, orbitals_per_atom, spin_labels)
+    per_atom = [len(kept) * len(spin_labels) for kept in basis]
+    n_orb_total = sum(per_atom)
+    max_index = max(max(i, j) for (_r, i, j) in hr)
     if max_index != n_orb_total:
         raise ValueError(
-            f"_hr.dat's highest orbital index is {max_index}, but "
-            f"{n_atoms} atoms x {orbitals_per_atom} orbitals/atom = {n_orb_total} "
-            f"were expected -- orbitals_per_atom is likely wrong."
+            f"_hr.dat's highest orbital index is {max_index}, but the basis "
+            f"({', '.join(f'{lab}:{n}' for lab, n in zip(lat.atom_labels, per_atom))}) "
+            f"totals {n_orb_total} orbitals -- orbitals_per_atom is likely wrong."
         )
 
     names, atom_of = _orbital_names(lat.atom_labels, orbitals_per_atom, spin_labels)
@@ -509,7 +688,10 @@ def build_lattice(lat: LatticeFile, hr: Dict[Tuple[RVec, int, int], complex],
     for (r, i, j), value in hr.items():
         if r != (0, 0, 0) or i != j:
             continue
-        if abs(value.imag) > value_threshold:
+        # Fixed tolerance, deliberately NOT value_threshold: that one is a
+        # relative cut on hopping magnitudes, while this is a numerical-noise
+        # check on a quantity that must be exactly real.
+        if abs(value.imag) > 1e-8:
             raise ValueError(
                 f"Onsite term (orbital {i}, R=0) has non-negligible imaginary "
                 f"part {value.imag!r} -- onsite energies must be real."
@@ -523,8 +705,22 @@ def build_lattice(lat: LatticeFile, hr: Dict[Tuple[RVec, int, int], complex],
     ]
     lattice.add_sublattices(*sublattices)
 
+    # The threshold is RELATIVE to the largest hopping in this dataset, so it
+    # is invariant under the file's energy unit and means the same thing for
+    # every material -- an absolute cut in eV would silently change meaning
+    # on a file written in Ry, or on a material with a different bandwidth.
+    # The reference is the largest HOPPING, not the largest matrix element:
+    # on-site energies are typically much larger and are not scaled by this.
+    largest_hopping = max(
+        (abs(value) for (r, i, j), value in hr.items()
+         if not (r == (0, 0, 0) and i == j)),
+        default=0.0,
+    )
+    absolute_threshold = value_threshold * largest_hopping
+
     hoppings = []
     dropped_small = 0
+    dropped_small_max_magnitude = 0.0
     for (r, i, j), value in hr.items():
         r_active = tuple(r[axis] for axis in dims)
         if r == (0, 0, 0):
@@ -532,8 +728,9 @@ def build_lattice(lat: LatticeFile, hr: Dict[Tuple[RVec, int, int], complex],
                 continue  # onsite (i == j) or lower triangle (auto-mirrored from i < j)
         elif not _is_positive(r_active):
             continue  # this is the auto-mirrored conjugate of the +R, (j, i) term
-        if abs(value) < value_threshold:
+        if abs(value) < absolute_threshold:
             dropped_small += 1
+            dropped_small_max_magnitude = max(dropped_small_max_magnitude, abs(value))
             continue
         hoppings.append((list(r_active), names[i - 1], names[j - 1], value))
 
@@ -545,6 +742,10 @@ def build_lattice(lat: LatticeFile, hr: Dict[Tuple[RVec, int, int], complex],
         "onsite_terms_kept": onsite_kept,
         "hoppings_kept": len(hoppings),
         "dropped_below_threshold": dropped_small,
+        "dropped_below_threshold_max_magnitude": dropped_small_max_magnitude,
+        "largest_hopping": largest_hopping,
+        "value_threshold_relative": value_threshold,
+        "value_threshold_absolute": absolute_threshold,
         "dropped_by_max_hopping_range": dropped_range,
         "dropped_by_max_hopping_range_max_magnitude": dropped_range_max_magnitude,
         "fermi_level": lat.fermi_level,
@@ -678,51 +879,74 @@ def atomic_L_matrices(spin_labels: Sequence[str] = ("u", "d")) -> Dict[str, np.n
     return {name: np.kron(np.eye(n_spin), M) for name, M in L.items()}
 
 
-def embed_atomic_operator(op: np.ndarray, n_atoms: int, orbitals_per_atom: int,
+def embed_atomic_operator(op: np.ndarray, n_atoms: int, orbitals_per_atom,
                            spin_labels: Sequence[str], spatial: bool) -> np.ndarray:
     """Embed a single-atom operator into the full n_orb_total x n_orb_total
-    system, block-diagonal across atoms (on-site operator: zero between
-    different atoms, identical block repeated for every atom).
+    system, block-diagonal across atoms (an on-site operator: zero between
+    different atoms).
 
-    op : (9, 9) if spatial=True (an orbital operator like Lx, identical for
-    every spin -- embedded as kron(I_spin, op), matching this module's
-    spin-major ordering, see _orbital_names()'s docstring), or (2, 2) if
-    spatial=False (a spin operator like Sz, identical for every spatial
-    orbital -- embedded as kron(op, I_orbital))."""
+    op : for spatial=True, the operator in the FULL spatial basis (9x9 for
+    spd) -- an orbital operator like Lx, identical for every spin, embedded
+    as kron(I_spin, op) within each atom's block. For spatial=False, a
+    (n_spin, n_spin) spin operator like Sz, identical for every spatial
+    orbital, embedded as kron(op, I_orbital).
+
+    Atoms may carry different bases. When an atom keeps only some of the
+    spatial orbitals, `op` is RESTRICTED to the rows and columns that atom
+    still has, and it is that restriction which is placed in its block. So
+    dropping an orbital simply removes its row and column from the operator
+    -- correct for L and the quadrupoles, whose matrix elements between the
+    surviving orbitals do not depend on which others were removed.
+
+    Note this is a truncation, not a downfolding: matrix elements that ran
+    THROUGH a dropped orbital are gone, not folded into the rest.
+    """
     n_spin = len(spin_labels)
-    n_spatial = orbitals_per_atom // n_spin
-    if spatial:
-        if op.shape != (n_spatial, n_spatial):
-            raise ValueError(f"expected a ({n_spatial}, {n_spatial}) spatial operator, "
-                              f"got {op.shape}")
-        atom_block = np.kron(np.eye(n_spin), op)
-    else:
-        if op.shape != (n_spin, n_spin):
-            raise ValueError(f"expected a ({n_spin}, {n_spin}) spin operator, got {op.shape}")
-        atom_block = np.kron(op, np.eye(n_spatial))
+    basis = _normalize_basis(n_atoms, orbitals_per_atom, spin_labels)
+    offsets = _basis_offsets(basis, n_spin)
+    n_orb_total = sum(len(kept) * n_spin for kept in basis)
 
-    n_orb_total = n_atoms * orbitals_per_atom
+    if not spatial and op.shape != (n_spin, n_spin):
+        raise ValueError(f"expected a ({n_spin}, {n_spin}) spin operator, got {op.shape}")
+    if spatial:
+        widest = max(max(kept) for kept in basis if kept) + 1
+        if op.ndim != 2 or op.shape[0] != op.shape[1] or op.shape[0] < widest:
+            raise ValueError(
+                f"expected a square spatial operator of size at least {widest} "
+                f"(the highest spatial index any atom keeps), got {op.shape}"
+            )
+
     full = np.zeros((n_orb_total, n_orb_total), dtype=complex)
-    for atom in range(n_atoms):
-        lo, hi = atom * orbitals_per_atom, (atom + 1) * orbitals_per_atom
-        full[lo:hi, lo:hi] = atom_block
+    for atom, kept in enumerate(basis):
+        if spatial:
+            block = np.kron(np.eye(n_spin), op[np.ix_(kept, kept)])
+        else:
+            block = np.kron(op, np.eye(len(kept)))
+        lo = offsets[atom]
+        hi = lo + len(kept) * n_spin
+        full[lo:hi, lo:hi] = block
     return full
 
 
-def standard_operators(n_atoms: int, orbitals_per_atom: int = 18,
+def standard_operators(n_atoms: int, orbitals_per_atom=18,
                         spin_labels: Sequence[str] = ("u", "d")) -> Dict[str, np.ndarray]:
     """All standard operators (Lx, Ly, Lz, Sx, Sy, Sz, and the 5 orbital
     quadrupole moments Oxy/Oyz/Ozx/Ox2-y2/O3z2-r2), each embedded to the
     full (n_orb_total, n_orb_total) system via embed_atomic_operator().
-    Requires orbitals_per_atom == 9 * len(spin_labels) (the spd-times-spin
-    convention _SPD_BASIS/_spd_angular_momentum_matrices() are built for)."""
+
+    Every atom's basis must be drawn from the 9-orbital spd set
+    _SPD_BASIS is built for, but atoms need not keep the same subset of it
+    -- each atom's operator block is the spd matrix restricted to the
+    orbitals that atom still has."""
     n_spatial = len(_SPD_BASIS)
-    if orbitals_per_atom != n_spatial * len(spin_labels):
-        raise ValueError(
-            f"standard_operators() assumes {n_spatial} spatial (spd) orbitals x "
-            f"{len(spin_labels)} spins = {n_spatial * len(spin_labels)} per atom, "
-            f"got orbitals_per_atom={orbitals_per_atom}"
-        )
+    basis = _normalize_basis(n_atoms, orbitals_per_atom, spin_labels)
+    for atom, kept in enumerate(basis):
+        if kept and max(kept) >= n_spatial:
+            raise ValueError(
+                f"atom {atom} keeps spatial orbital index {max(kept)}, but "
+                f"standard_operators() is built for the {n_spatial}-orbital "
+                f"spd basis {_SPD_BASIS} (indices 0..{n_spatial - 1})"
+            )
 
     L = _spd_angular_momentum_matrices()
     S = _spin_half_matrices()

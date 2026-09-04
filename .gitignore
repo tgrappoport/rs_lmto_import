@@ -5,3 +5,5 @@ __pycache__/
 *.dat
 !mos2/*.dat
 *_neighbor_compare.png
+.venv/
+*.png
